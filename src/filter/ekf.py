@@ -205,6 +205,13 @@ class EKF:
         self.x_snapshot = self.x.copy()
         self.P_snapshot = self.P.copy()
 
+        self.position_consistency_min_dt = 1e-3
+        self.position_consistency_min_displacement = 0.25
+        self.position_consistency_min_speed = 0.5
+        self.position_consistency_velocity_blend = 0.5
+        self.position_consistency_velocity_var = 1.0
+        self.position_consistency_yaw_var = np.deg2rad(10.0) ** 2
+
     def init_state(self, pos, vel, quat):
         self.x[0:3] = pos
         self.x[3:6] = vel
@@ -237,6 +244,54 @@ class EKF:
         q_new = np.array([corrected_xyzw[3], corrected_xyzw[0], corrected_xyzw[1], corrected_xyzw[2]])
         q_new /= np.linalg.norm(q_new)
         return q_new
+
+    @staticmethod
+    def _is_position_only_mask(mask: Optional[np.ndarray]) -> bool:
+        if mask is None:
+            return False
+
+        mask_arr = np.asarray(mask, dtype=bool).reshape(-1)
+        if mask_arr.shape[0] != BASE_DIM:
+            return False
+
+        expected = np.zeros(BASE_DIM, dtype=bool)
+        expected[:3] = True
+        return np.array_equal(mask_arr, expected)
+
+    def _apply_position_correction_consistency(
+        self,
+        x_after: np.ndarray,
+        P: np.ndarray,
+        anchor_state: Optional[np.ndarray],
+        anchor_timestamp: Optional[float],
+        timestamp: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if anchor_state is None or anchor_timestamp is None:
+            return x_after, P
+
+        dt = float(timestamp - anchor_timestamp)
+        if dt <= self.position_consistency_min_dt:
+            return x_after, P
+
+        displacement_xy = x_after[:2] - anchor_state[:2]
+        if np.linalg.norm(displacement_xy) < self.position_consistency_min_displacement:
+            return x_after, P
+
+        inferred_velocity_xy = displacement_xy / dt
+        x_consistent = x_after.copy()
+        x_consistent[3:5] = (
+            (1.0 - self.position_consistency_velocity_blend) * x_after[3:5]
+            + self.position_consistency_velocity_blend * inferred_velocity_xy
+        )
+
+        if np.linalg.norm(x_consistent[3:5]) >= self.position_consistency_min_speed:
+            yaw = np.arctan2(x_consistent[4], x_consistent[3])
+            x_consistent[6:10] = self._set_quat_yaw_wxyz(yaw, x_consistent[6:10])
+
+        P_consistent = P.copy()
+        P_consistent[3:6, 3:6] += np.eye(3) * self.position_consistency_velocity_var
+        P_consistent[6:10, 6:10] += np.eye(4) * self.position_consistency_yaw_var
+        return x_consistent, P_consistent
 
     def _propagate_state(self, x, acc, gyro, dt):
         pos = x[0:3]
@@ -346,6 +401,7 @@ class EKF:
                     inject=b.inject,
                     h=b.h,
                     enabled=b.enabled,
+                    mask=None if b.mask is None else np.asarray(b.mask, dtype=bool).copy(),
                 ),
             ))
     
@@ -379,6 +435,8 @@ class EKF:
         events.sort(key=lambda e: (e.timestamp, 0 if e.type == 'prediction' else 1))
 
         intermediate_estimates = []
+        last_consistent_state: Optional[np.ndarray] = None
+        last_consistent_timestamp: Optional[float] = None
 
         for event in events:
             if event.type == 'prediction':
@@ -391,6 +449,8 @@ class EKF:
                 F = F_numpy(x, np.concatenate([acc_unbiased, gyro_unbiased]), snap.dt)
                 G = G_numpy(x, np.concatenate([acc_unbiased, gyro_unbiased]), snap.dt)
                 P = F @ P @ F.T + G @ self.Q @ G.T
+                last_consistent_state = x.copy()
+                last_consistent_timestamp = snap.timestamp
 
             elif event.type == 'correction':
                 corr = event.data
@@ -431,7 +491,19 @@ class EKF:
                 I = np.eye(len(x))
                 IKH = I - K @ H
                 P = IKH @ P @ IKH.T + K @ R @ K.T
+
+                if self._is_position_only_mask(b.mask):
+                    x, P = self._apply_position_correction_consistency(
+                        x_after=x,
+                        P=P,
+                        anchor_state=last_consistent_state,
+                        anchor_timestamp=last_consistent_timestamp,
+                        timestamp=corr.timestamp,
+                    )
+
                 intermediate_estimates.append(x.copy())
+                last_consistent_state = x.copy()
+                last_consistent_timestamp = corr.timestamp
 
         # --- Update current state ---
         self.x = x.copy()
