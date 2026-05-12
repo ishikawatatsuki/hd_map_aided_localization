@@ -107,7 +107,8 @@ if __name__ == "__main__":
     print(f"Total parameters:     {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
  
-    x = torch.randn(4, 32, 6)
-    out = model(x)
-    print("R shape:", out.shape)
-    print(out)
+    with torch.no_grad():
+        x = torch.randn(4, 32, 6)
+        out = model(x)
+        print("R shape:", out.shape)
+        print(out)

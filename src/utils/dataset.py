@@ -109,6 +109,10 @@ def get_kitti_data(seq: str, root_dir: str = "./data/KITTI", is_sync: bool = Tru
     orientation_array_full = orientation_array.copy()
     lla_array_full = lla_array.copy()
 
+    min_lon, min_lat, _ = np.min(lla_array, axis=0)
+    max_lon, max_lat, _ = np.max(lla_array, axis=0)
+    local_edges = edges_map.cx[min_lon:max_lon, min_lat:max_lat]
+
     if is_sync:
         # For sync data, we can directly use the 10Hz samples without windowing.
         return KittiData(
@@ -129,7 +133,7 @@ def get_kitti_data(seq: str, root_dir: str = "./data/KITTI", is_sync: bool = Tru
             initial_position=position_array_full[0],
             initial_velocity=velocity_array_full[0],
             initial_orientation=orientation_array_full[0],
-            edges=edges_map,
+            edges=local_edges,
             transformer=transformer
         )
     
@@ -184,6 +188,6 @@ def get_kitti_data(seq: str, root_dir: str = "./data/KITTI", is_sync: bool = Tru
         initial_position=position_array_full[0],
         initial_velocity=velocity_array_full[0],
         initial_orientation=orientation_array_full[0],
-        edges=edges_map,
+        edges=local_edges,
         transformer=transformer
     )

@@ -71,7 +71,10 @@ class WindowedICPMapMatcher:
                  verbose=False,
                  max_consecutive_misses=5,
                  min_point_spacing=1.0,
-                 max_source_jump=20.0
+                 max_source_jump=20.0,
+                 rise_flag_by_travel_distance=False,
+                 distance_threshold=0.01,
+                 time_threshold=10.0
                 ):
         """
         Parameters
@@ -100,6 +103,12 @@ class WindowedICPMapMatcher:
             Minimum spacing between points to consider for matching (in coordinate units). This can handle static points or very close points that might cause issues.
         max_source_jump : float, optional
             Maximum allowed jump in source points between matches (in coordinate units). This can help detect when the source points have diverged too much, indicating a potential reset or loss of tracking.
+        rise_flag_by_travel_distance : bool, optional
+            If True, trigger matching when distance threshold is reached in addition to correspondence count.
+        distance_threshold : float, optional
+            Total distance traveled (in coordinate units) to trigger matching when rise_flag_by_travel_distance is True.
+        time_threshold : float, optional
+            Maximum time gap (in seconds) allowed between correspondences. Older correspondences are cleared if gap exceeds this.
         """
         self.window_size = window_size
         self.match_frequency = match_frequency if match_frequency else window_size
@@ -114,6 +123,9 @@ class WindowedICPMapMatcher:
         self.max_consecutive_misses = max_consecutive_misses
         self.min_point_spacing = min_point_spacing
         self.max_source_jump = max_source_jump
+        self.rise_flag_by_travel_distance = rise_flag_by_travel_distance
+        self.distance_threshold = distance_threshold
+        self.time_threshold = time_threshold
         
         # Circular buffers for correspondences
         self.sources = []  # Estimated positions (dead reckoning)
@@ -124,6 +136,7 @@ class WindowedICPMapMatcher:
         self.total_matches = 0
         self.added_since_match = 0
         self.consecutive_misses = 0
+        self.cumulative_distance = 0.0  # Accumulated travel distance since last match
         
         # Statistics
         self.stats_history = []
@@ -135,7 +148,10 @@ class WindowedICPMapMatcher:
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logging.DEBUG if verbose else logging.INFO)
         if self.verbose:
-            print(f"Initialized WindowedICPMapMatcher with window_size={window_size}, match_frequency={self.match_frequency}, use_ransac={use_ransac}")
+            msg = f"Initialized WindowedICPMapMatcher with window_size={window_size}, match_frequency={self.match_frequency}, use_ransac={use_ransac}"
+            if self.rise_flag_by_travel_distance:
+                msg += f", distance_trigger={distance_threshold}m, time_threshold={time_threshold}s"
+            print(msg)
 
 
     def register_miss(self):
@@ -159,10 +175,27 @@ class WindowedICPMapMatcher:
         target : array-like, shape (2,) or (3,)
             Matched OSM position
         metadata : dict, optional
-            Additional information (timestamp, index, etc.)
+            Additional information (timestamp, index, etc.).
+            Expected to contain 'timestamp' (float, epoch seconds) if time-based clearing is enabled.
         """
         source = np.asarray(source)
         target = np.asarray(target)
+
+        # Get current timestamp from metadata (if available)
+        current_timestamp = None
+        if metadata is not None and 'timestamp' in metadata:
+            current_timestamp = metadata['timestamp']
+        
+        # Time-based buffer clearing: if gap between first and current correspondence exceeds threshold
+        if self.time_threshold is not None and len(self.metadata) > 0 and current_timestamp is not None:
+            first_timestamp = self.metadata[0].get('timestamp', None)
+            if first_timestamp is not None:
+                time_gap = current_timestamp - first_timestamp
+                if time_gap > self.time_threshold:
+                    if self.verbose:
+                        print(f"Clearing ICP buffer: time gap {time_gap:.2f}s exceeds threshold {self.time_threshold}s")
+                    self.clear_buffer(reset_added_since_match=True)
+                    self.cumulative_distance = 0.0
 
         # Optional distance-based decimation
         if self.min_point_spacing is not None and len(self.sources) > 0:
@@ -175,9 +208,15 @@ class WindowedICPMapMatcher:
                 if self.verbose:
                     print("Large source jump detected; clearing ICP buffer")
                 self.clear_buffer(reset_added_since_match=True)
+                self.cumulative_distance = 0.0
 
         # valid correspondence resets miss streak
         self.consecutive_misses = 0
+
+        # Accumulate travel distance
+        if len(self.sources) > 0:
+            distance_step = np.linalg.norm(source - self.sources[-1])
+            self.cumulative_distance += distance_step
 
         # Maintain circular buffer
         if len(self.sources) >= self.window_size:
@@ -191,15 +230,65 @@ class WindowedICPMapMatcher:
         self.added_since_match += 1
     
     def should_match(self):
-        """Check if we should perform ICP matching."""
+        """
+        Check if we should perform ICP matching.
+        
+        Triggers matching when EITHER:
+        - Accumulated correspondences reach match_frequency, OR
+        - (if rise_flag_by_travel_distance enabled) Cumulative distance exceeds distance_threshold
+        
+        Returns
+        -------
+        bool
+            True if matching should be performed
+        """
         min_pts = max(3, self.ransac_sample_size)
         if len(self.sources) < min_pts:
             return False
-        return self.added_since_match >= self.match_frequency
+        
+        # Trigger by correspondence count
+        count_trigger = self.added_since_match >= self.match_frequency
+        
+        # Trigger by travel distance
+        distance_trigger = False
+        if self.rise_flag_by_travel_distance:
+            distance_trigger = self.cumulative_distance >= self.distance_threshold
+        
+        # Return True if either trigger is active
+        return count_trigger or distance_trigger
     
     def get_buffer_size(self):
         """Get current number of correspondences in buffer."""
         return len(self.sources)
+    
+    def get_cumulative_distance(self):
+        """Get cumulative travel distance accumulated since last match."""
+        return self.cumulative_distance
+    
+    def get_buffer_info(self):
+        """
+        Get detailed information about current buffer state.
+        
+        Returns
+        -------
+        dict
+            Dictionary with keys:
+            - 'buffer_size': int, number of correspondences
+            - 'added_since_match': int, correspondences added since last match
+            - 'cumulative_distance': float, total distance accumulated
+            - 'distance_to_trigger': float, remaining distance to travel for distance-based trigger
+            - 'correspondences_to_trigger': int, remaining correspondences for count-based trigger
+        """
+        distance_to_trigger = max(0, self.distance_threshold - self.cumulative_distance) if self.rise_flag_by_travel_distance else None
+        correspondences_to_trigger = max(0, self.match_frequency - self.added_since_match)
+        
+        return {
+            'buffer_size': len(self.sources),
+            'added_since_match': self.added_since_match,
+            'cumulative_distance': self.cumulative_distance,
+            'distance_to_trigger': distance_to_trigger,
+            'correspondences_to_trigger': correspondences_to_trigger,
+        }
     
     def clear_buffer(self, reset_added_since_match=False):
         """Clear the correspondence buffer."""
@@ -209,6 +298,7 @@ class WindowedICPMapMatcher:
         self.consecutive_misses = 0
         if reset_added_since_match:
             self.added_since_match = 0
+            self.cumulative_distance = 0.0
 
     def _transform_2d_to_3d(self, T_2d: np.ndarray) -> np.ndarray:
         """
@@ -484,6 +574,7 @@ class WindowedICPMapMatcher:
             return  MatchingResult(success=False)
         
         self.added_since_match = 0
+        self.cumulative_distance = 0.0  # Reset distance accumulator after match
         
         # Convert to numpy arrays
         A = np.array(self.sources)  # Source points (estimated)
@@ -547,6 +638,17 @@ class WindowedICPMapMatcher:
         self.total_matches += 1
         
         self.logger.debug(f"\n=== ICP Match #{self.total_matches} ===")
+        
+        # Log which trigger caused the match
+        trigger_msg = "Trigger: "
+        if self.added_since_match >= self.match_frequency and (not self.rise_flag_by_travel_distance or self.cumulative_distance < self.distance_threshold):
+            trigger_msg += f"Correspondence count ({self.added_since_match} >= {self.match_frequency})"
+        elif self.rise_flag_by_travel_distance and self.cumulative_distance >= self.distance_threshold:
+            trigger_msg += f"Travel distance ({self.cumulative_distance:.4f} >= {self.distance_threshold})"
+        else:
+            trigger_msg += "Correspondence count & Travel distance"
+        self.logger.debug(trigger_msg)
+        
         self.logger.debug(f"Buffer size: {len(A)}")
         self.logger.debug(f"Inliers: {inlier_count}/{len(A)} ({inlier_ratio:.1%})")
         self.logger.debug(f"RMS before: {rms_before:.6f}")
@@ -588,9 +690,9 @@ class WindowedICPMapMatcher:
     
     def reset(self):
         """Reset the matcher (clear buffer and statistics)."""
-        self.clear_buffer()
-        self.total_added = 0
+        self.clear_buffer(reset_added_since_match=True)
         self.total_matches = 0
+        self.cumulative_distance = 0.0
         self.stats_history = []
         self.last_result = None
 

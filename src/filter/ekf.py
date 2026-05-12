@@ -99,6 +99,7 @@ class MeasurementBlock:
     h: Optional[Callable[[np.ndarray], np.ndarray]] = None
     enabled: bool = True
     mask: Optional[np.ndarray] = None  # for batch updates with multiple clones
+    measurement_type: Optional[FusionData] = None
 
     @classmethod
     def from_measurement_type(cls, measurement_type: FusionData, z: np.ndarray, R: np.ndarray, mask: Optional[np.ndarray] = None):
@@ -111,6 +112,7 @@ class MeasurementBlock:
                 inject=inject_heading_yaw_only,
                 h=measurement_heading,
                 mask=mask,
+                measurement_type=measurement_type,
                 enabled=True
             )
         elif measurement_type == FusionData.ORIENTATION:
@@ -122,6 +124,7 @@ class MeasurementBlock:
                 inject=inject_additive,
                 h=measurement_quat,
                 mask=mask,
+                measurement_type=measurement_type,
                 enabled=True
             )
         elif measurement_type == FusionData.POSITION:
@@ -132,6 +135,7 @@ class MeasurementBlock:
                 residual=residual_linear,
                 inject=inject_additive,
                 mask=mask,
+                measurement_type=measurement_type,
                 enabled=True
             )
         elif measurement_type == FusionData.LINEAR_VELOCITY:
@@ -142,6 +146,7 @@ class MeasurementBlock:
                 residual=residual_linear,
                 inject=inject_additive,
                 mask=mask,
+                measurement_type=measurement_type,
                 enabled=True
             )
         elif measurement_type == FusionData.VELOCITY_CONSTRAINT:
@@ -152,6 +157,7 @@ class MeasurementBlock:
                 residual=residual_velocity_constraint,
                 inject=inject_additive,
                 mask=mask,
+                measurement_type=measurement_type,
                 enabled=True
             )
         else:
@@ -245,54 +251,6 @@ class EKF:
         q_new /= np.linalg.norm(q_new)
         return q_new
 
-    @staticmethod
-    def _is_position_only_mask(mask: Optional[np.ndarray]) -> bool:
-        if mask is None:
-            return False
-
-        mask_arr = np.asarray(mask, dtype=bool).reshape(-1)
-        if mask_arr.shape[0] != BASE_DIM:
-            return False
-
-        expected = np.zeros(BASE_DIM, dtype=bool)
-        expected[:3] = True
-        return np.array_equal(mask_arr, expected)
-
-    def _apply_position_correction_consistency(
-        self,
-        x_after: np.ndarray,
-        P: np.ndarray,
-        anchor_state: Optional[np.ndarray],
-        anchor_timestamp: Optional[float],
-        timestamp: float,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        if anchor_state is None or anchor_timestamp is None:
-            return x_after, P
-
-        dt = float(timestamp - anchor_timestamp)
-        if dt <= self.position_consistency_min_dt:
-            return x_after, P
-
-        displacement_xy = x_after[:2] - anchor_state[:2]
-        if np.linalg.norm(displacement_xy) < self.position_consistency_min_displacement:
-            return x_after, P
-
-        inferred_velocity_xy = displacement_xy / dt
-        x_consistent = x_after.copy()
-        x_consistent[3:5] = (
-            (1.0 - self.position_consistency_velocity_blend) * x_after[3:5]
-            + self.position_consistency_velocity_blend * inferred_velocity_xy
-        )
-
-        if np.linalg.norm(x_consistent[3:5]) >= self.position_consistency_min_speed:
-            yaw = np.arctan2(x_consistent[4], x_consistent[3])
-            x_consistent[6:10] = self._set_quat_yaw_wxyz(yaw, x_consistent[6:10])
-
-        P_consistent = P.copy()
-        P_consistent[3:6, 3:6] += np.eye(3) * self.position_consistency_velocity_var
-        P_consistent[6:10, 6:10] += np.eye(4) * self.position_consistency_yaw_var
-        return x_consistent, P_consistent
-
     def _propagate_state(self, x, acc, gyro, dt):
         pos = x[0:3]
         vel = x[3:6]
@@ -300,6 +258,8 @@ class EKF:
         acc_bias = x[10:13]
         gyro_bias = x[13:16]
 
+        # new_acc_bias = acc_bias
+        # new_gyro_bias = gyro_bias
         new_acc_bias = acc_bias + np.random.normal(
             0, self.acc_bias_noise_std**2, 3
         ) * dt
@@ -377,9 +337,10 @@ class EKF:
             y = b.residual(z, zhat, self.x)
             S = H @ self.P @ H.T + R
             K = self.P @ H.T @ np.linalg.inv(S)
-            dx = K @ y
+
             if b.mask is not None:
-                dx *= b.mask
+                K = K * np.asarray(b.mask, dtype=float).reshape(-1, 1)
+            dx = K @ y
 
             if b.inject is None:
                 self.x = self.x + dx
@@ -402,6 +363,7 @@ class EKF:
                     h=b.h,
                     enabled=b.enabled,
                     mask=None if b.mask is None else np.asarray(b.mask, dtype=bool).copy(),
+                    measurement_type=b.measurement_type,
                 ),
             ))
     
@@ -435,9 +397,7 @@ class EKF:
         events.sort(key=lambda e: (e.timestamp, 0 if e.type == 'prediction' else 1))
 
         intermediate_estimates = []
-        last_consistent_state: Optional[np.ndarray] = None
-        last_consistent_timestamp: Optional[float] = None
-
+        timestamp = None
         for event in events:
             if event.type == 'prediction':
                 snap = event.data
@@ -449,8 +409,6 @@ class EKF:
                 F = F_numpy(x, np.concatenate([acc_unbiased, gyro_unbiased]), snap.dt)
                 G = G_numpy(x, np.concatenate([acc_unbiased, gyro_unbiased]), snap.dt)
                 P = F @ P @ F.T + G @ self.Q @ G.T
-                last_consistent_state = x.copy()
-                last_consistent_timestamp = snap.timestamp
 
             elif event.type == 'correction':
                 corr = event.data
@@ -478,9 +436,9 @@ class EKF:
                 y = b.residual(z, zhat, x)
                 S = H @ P @ H.T + R
                 K = P @ H.T @ np.linalg.inv(S)
-                dx = K @ y
                 if b.mask is not None:
-                    dx *= b.mask
+                    K = K * np.asarray(b.mask, dtype=float).reshape(-1, 1)
+                dx = K @ y
 
                 if b.inject is None:
                     x = x + dx
@@ -492,18 +450,10 @@ class EKF:
                 IKH = I - K @ H
                 P = IKH @ P @ IKH.T + K @ R @ K.T
 
-                if self._is_position_only_mask(b.mask):
-                    x, P = self._apply_position_correction_consistency(
-                        x_after=x,
-                        P=P,
-                        anchor_state=last_consistent_state,
-                        anchor_timestamp=last_consistent_timestamp,
-                        timestamp=corr.timestamp,
-                    )
 
+            if timestamp is None or np.abs(event.timestamp - timestamp) > 0.05:
                 intermediate_estimates.append(x.copy())
-                last_consistent_state = x.copy()
-                last_consistent_timestamp = corr.timestamp
+                timestamp = event.timestamp
 
         # --- Update current state ---
         self.x = x.copy()
