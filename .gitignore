@@ -35,4 +35,5 @@ Thumbs.db
 venv
 data/KITTI/sync/2011_09_30
 data/KITTI/unsync/2011_09_30
-data/KITTI/raw/karlsruhe_graph.graphml
+
+*.graphml
