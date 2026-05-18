@@ -102,7 +102,7 @@ b_w_new = b_w + Matrix([n_bwx, n_bwy, n_bwz]) * dt
 
 fx = Matrix.vstack(p_new, v_new, q_new, b_a_new, b_w_new)
 F_jacobian = fx.jacobian(state)
-G_jacobian = fx.jacobian(process_noise)
+G_jacobian = fx.jacobian(control_input)
 
 # Evaluate Jacobians at zero process noise (mean propagation)
 zero_noise = {

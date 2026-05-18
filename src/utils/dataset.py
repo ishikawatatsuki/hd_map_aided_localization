@@ -126,9 +126,7 @@ def get_kitti_data(seq: str, root_dir: str = "./data/KITTI", is_sync: bool = Tru
             lla_position=lla_array,
             positions=position_array,
             velocities=velocity_array,
-            orientations=np.array(
-                [Rotation.from_euler('xyz', euler).as_quat(scalar_first=True) for euler in orientation_array]
-            ),
+            orientations=orientation_array,
             initial_lla=lla_array_full[0],
             initial_position=position_array_full[0],
             initial_velocity=velocity_array_full[0],

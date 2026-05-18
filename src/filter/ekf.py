@@ -201,10 +201,7 @@ class EKF:
         self.gravity = np.array([0, 0, -9.81])
 
         self.P = np.eye(BASE_DIM) * 0.1
-        self.Q = np.diag(
-            [self.acc_noise_std**2] * 3 + [self.gyro_noise_std**2] * 3 +
-            [self.acc_bias_noise_std**2] * 3 + [self.gyro_bias_noise_std**2] * 3
-        )
+        self.Q = np.diag([self.acc_noise_std**2] * 3 + [self.gyro_noise_std**2] * 3)
 
         self.predictions: List[PredictionRecord] = []
         self.corrections: List[CorrectionRecord] = []
@@ -258,14 +255,12 @@ class EKF:
         acc_bias = x[10:13]
         gyro_bias = x[13:16]
 
-        # new_acc_bias = acc_bias
-        # new_gyro_bias = gyro_bias
         new_acc_bias = acc_bias + np.random.normal(
             0, self.acc_bias_noise_std**2, 3
-        ) * dt
+        )
         new_gyro_bias = gyro_bias + np.random.normal(
             0, self.gyro_bias_noise_std**2, 3
-        ) * dt
+        )
 
         acc_unbiased = acc - acc_bias
         gyro_unbiased = gyro - gyro_bias
