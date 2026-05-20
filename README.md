@@ -55,22 +55,6 @@ The structure below focuses on source, configs, and project assets that are inte
 	└── KITTI/
 ```
 
-## Excluded by `.gitignore`
-
-The following paths/patterns are currently ignored and should not be treated as versioned project documentation targets:
-
-- virtual environments and caches: `venv/`, `__pycache__/`, `*.egg-info/`
-- build artifacts: `dist/`, `build/`
-- editor/system files: `.vscode/`, `.idea/`, `.DS_Store`, swap files
-- logs and temp files: `*.log`, `*.tmp`, `*.temp`
-- temporary and experiment folders: `temp/`, `_experiments/`
-- large raw dataset folders:
-  - `data/KITTI/sync/2011_09_30`
-  - `data/KITTI/unsync/2011_09_30`
-- map raw files: `*.graphml`
-
-Note: If any ignored files are already tracked historically, Git may still show them in the working tree. The list above reflects intended ignore policy.
-
 ## Setup Requirements
 
 ### 1. System
